@@ -1,0 +1,551 @@
+#!/usr/bin/env bash
+set +m
+
+helpstr="\
+NAME
+    hadir - highly-available directory maintainer
+
+SYNOPSIS
+    hadir --main-link PATH --primary-dir PATH --secondary-dir PATH
+
+DESCRIPTION
+    Maintains high-availability of a directory, such as on a network filesystem 
+    share, by using a local backup copy and failing over to that in case the 
+    primary directory becomes unresonsive or shows errors.
+
+    The main link in normal state should be symbolic link to the primary 
+    directory.  This script loops forever, syncing the primary directory to the 
+    secondary directory.  If the sync fails, this script adjusts the main 
+    symbolic link to point to the secondary directory.  It continues to try 
+    dry-runs of the primary-to-secondary sync.  If a dry-run succeeds, it tries 
+    to sync back the secondary to the primary (but only for existing, older 
+    files in the primary -- see note below).  If that succeeds, it adjusts the 
+    symbolic link to point back to the primary directory and continues with 
+    normal operation.
+
+    This is designed for the special case where files do not get added or 
+    removed by the system relying on this main link being highly available.  
+    Specifically, in failover mode, if a file get's added or deleted from the 
+    live, secondary copy, that addition/deletion does not get propogated back 
+    to the primary when things failback.  Modifications to files that still 
+    exist on the primary are synced back during failback, though.
+
+    This doesn't save exactly what the errors are from any of the syncs -- in 
+    practice it usually hangs.
+
+    Furthermore, rsync just checks sized and modification times.  It's possible 
+    this misses actual errors that would happen when the files are used.
+
+OPTIONS
+    --main-link PATH
+        The symbolic link used to address the directory by the systems that 
+        require it to be highly available.  If daemonizing, this needs to be an 
+        absolute path.
+
+    --primary-dir PATH
+        The primary directory.
+        If daemonizing, this needs to be an absolute path.
+
+    --secondary-dir PATH
+        The secondary directory.
+        If daemonizing, this needs to be an absolute path.
+
+    --max-sync-time SECONDS
+        The maximum time expected for a sync to a complete successfully.  A 
+        sync taking longer than this is amount of time is considered a failure 
+        and killed.  Note that this script will always wait this long, every 
+        sync, so the larger this is the less frequently the directory is 
+        synced.  Default is 5 seconds.
+
+        Note also that this time is also used for the maximum time the initial 
+        test of the directories existince is allowed to take.  If --primary-dir 
+        resides on an say, an external drive, this needs to be long enough for 
+        that to spin up.  Likewise for normal syncing, if 
+        --sleep-interval-between-syncs is so long that the drive may spin down 
+        in between.
+
+    --sleep-interval-between-syncs SECONDS
+        Additional time to sleep after each successful sync.  See above note 
+        about --max-sync-time introducing sleep also.  Default is 5 seconds.
+
+    --write-probe COMMAND
+        Run COMMAND after every sync as an additional test of the viability of 
+        the primary directory.  Use this to implement a test of writing to a 
+        file in the directory, since syncing test reads only.  If the probe 
+        fails, the directory is failed over, same as if a sync fails.  COMMAND 
+        is run with bash -c as-is, so make sure it's valid, safe shell code, 
+        and it should use absolute filesystem paths.  Of course, it should also 
+        directly use the primary-dir, not the main-link.  A good write probe is 
+        something like:
+
+            --write-probe \"date > /PATH/TO/PRIMARY/hadir_write_probe.\$(hostname).out\"
+
+    --max-write-probe-time SECONDS
+        The maximum time expected for the write probe to complete 
+        successfully.  A write probe taking longer than this amount of time is 
+        considered a failure and killed.  Note that, if a write probe is used, 
+        this script will always wait this long, every sync, so the larger this 
+        is the less frequently the directory is synced.  Default is 3 seconds.
+
+    --log-file PATH
+        Place to write log messages.  Default is stdout.  If daemonizing, this 
+        needs to be an absolute path.
+
+    --command-output-file PATH
+        Place where output (both stdout and stderr) of sync and write probe 
+        commands is directed.  Default is /dev/null.  If daemonizing, this 
+        needs to be an absolute path.
+
+    --timestamp-command-output-file
+        Before each sync or write probe, write the current date and time to the 
+        command-output-file.
+
+    --email EMAIL_ADDRESS...
+        Email failover and failback events to the given EMAIL_ADDRESS.  
+        Multiple addresses may be given; separate them with whitespace.
+
+    --verbose
+        Log every step, even success.
+
+    --pretend
+        Don't actually modify any filesystem contents.  Echo command instead of 
+        syncing them (only appiles to foreground commands, not the background 
+        sync).
+
+    --daemonize
+        Run in daemon mode.
+
+    --config-file PATH
+        Source PATH, overriding any option defaults and command-line options 
+        given yet.  PATH must be valid, safe shell code -- it's executed 
+        as-is.  Variable names are the same as these options but with 
+        underscores instead of hyphens and leanding underscores/hyphens 
+        stripped.  You must look in this source code for what to do for options 
+        that have no argument, though.  If daemonizing, this needs to be an 
+        absolute path.
+
+    -h, --help
+        Print this help.
+
+REQUIREMENTS
+    n/a        
+
+BUGS
+    If the directory fails in the one-time short window in which this script is 
+    first starting, it may cause this script to hang rather than properly 
+    initiate a failover.
+
+AUTHOR
+    John Brunelle
+"
+
+
+#if this is only being run to get the help, just do it and quit
+getopt -q -l help -o h -- "$@" | egrep -q '^ -h|^ --help' && echo -n "$helpstr" && exit
+
+#if daemonizing, do that right away (can't do getopt yet since that modifies the arguments)
+daemonize=false;
+getopt -q -l daemonize -o h -- "$@" | egrep -q '^ --daemonize' && daemonize=true
+if $daemonize; then
+	if [ -z "${DAEMONIZED:-}" ]; then
+		export DAEMONIZED=1
+		setsid "$0" "$@"
+		exit
+	elif [ "$DAEMONIZED" -eq 1 ]; then
+		export DAEMONIZED=2
+		
+		"$0" "$@" <&0 &
+		exit
+	elif [ "$DAEMONIZED" -eq 2 ]; then
+		DAEMONIZED=y
+		cd /
+		test -t 0 && exec 0</dev/null
+		test -t 1 && exec 1>>/dev/null
+		test -t 2 && exec 2>>/dev/null
+		unset DAEMONIZED
+	else
+		echo "*** ERROR *** the DAEMONIZED environment variable appears to already be in use for some other purpose" >&2
+		exit 1
+	fi
+fi
+
+
+main_link=''
+primary_dir=''
+secondary_dir=''
+
+max_sync_time=5
+
+sleep_interval_between_syncs=5
+
+write_probe=''
+max_write_probe_time=3
+
+log_file=/dev/stdout
+command_output_file=/dev/null
+timestamp_command_output_file=false
+
+email=''
+
+verbose=false
+
+daemonize=false
+
+config_file=''
+
+#set this to echo to print commands instead of running them; set it to empty string in production (note that some output will still be redirected to $command_output_file)
+_prefix=''
+
+#whether or not to skip the extra loop sleep (internal use only)
+_skip_sleep=false
+
+log () {
+	echo "$(date '+%Y-%m-%d %H:%M:%S'): $@" >> "$log_file"
+}
+
+args=$(getopt -l main-link:,primary-dir:,secondary-dir:,max-sync-time:sleep-interval-between-syncs:,write-probe:,max-write-probe-time:,log-file:,command-output-file:,timestamp-command-output-file,email:,verbose,daemonize,config-file:,help -o ab:h -- "$@")
+if [ $? -ne 0 ]; then
+	exit 65  #(getopt will have written the error message)
+fi
+eval set -- "$args"
+while [ ! -z "$1" ]; do
+	case "$1" in
+		--main-link)
+			main_link="$2"
+			shift
+			;;
+		--primary-dir)
+			primary_dir="$2"
+			shift
+			;;
+		--secondary-dir)
+			secondary_dir="$2"
+			shift
+			;;
+		--max-sync-time)
+			max_sync_time="$2"
+			shift
+			;;
+		--sleep-interval-between-syncs)
+			sleep_interval_between_syncs="$2"
+			shift
+			;;
+		--write-probe)
+			write_probe="$2"
+			shift
+			;;
+		--max-write-probe-time)
+			max_write_probe_time="$2"
+			shift
+			;;
+		--log-file)
+			log_file="$2"
+			shift
+			;;
+		--command-output-file)
+			command_output_file="$2"
+			shift
+			;;
+		--timestamp-command-output-file)
+			timestamp_command_output_file=true
+			;;
+
+		--email)
+			email="$2"
+			shift
+			;;
+
+		--verbose)
+			verbose=true
+			;;
+		--pretend)
+			_prefix=echo
+			;;
+		
+		#(this should've been caught earlier, just here for completeness)
+		--daemonize)
+			daemonize=true
+			;;
+
+		--config-file)
+			config_file="$2"
+			shift
+			if [ -e "$config_file" ]; then
+				source "$config_file"
+			else
+				msg="*** ERROR *** config file [%s] does not exist ***"
+				#(since we're quitting, try extra hard to get this message to the user)
+				if [ -t 2 ] && ([ "$(readlink -e /dev/stdout)" != "$log_file" ] && [ "$(readlink -e /dev/sterr)" != "$log_file" ]); then
+					echo "$msg" >&2
+				fi
+				#(log_file may not have been parsed yet, so relying on the default)
+				log "$msg"
+				exit 1
+			fi
+			;;
+		
+		#(this should've been caught earlier, just here for completeness)
+		-h | --help)
+			echo -n "$helpstr"
+			exit 0
+			;;
+		
+		--) 
+			shift
+			break
+			;;
+	esac
+	shift
+done
+
+if $daemonize; then
+	#these can be helpful for debugging since by default stdout and stderr are lost
+	exec 1>>"$log_file"
+	exec 2>>"$log_file"
+fi
+
+if [ -z "$main_link" ] || [ -z "$primary_dir" ] ||  [ -z "$secondary_dir" ]; then
+	msg="*** ERROR *** --main-link, --primary-dir, and --secondary-dir are all required to be given"
+	#(since we're quitting, try extra hard to get this message to the user)
+	if [ -t 2 ] && ([ "$(readlink -e /dev/stdout)" != "$log_file" ] && [ "$(readlink -e /dev/sterr)" != "$log_file" ]); then
+		echo "$msg" >&2
+	fi
+	log "$msg"
+	exit 1
+fi
+#(they're required to exist, too, but that's done below, once actual filesystem operations start)
+
+email_subject_base="$(basename $0) for $main_link on $(hostname -s)"
+
+#---
+
+
+alive () { test -d /proc/"$1" && [ $(ps -o state= -p "$1") != Z ] ; }
+
+make_sure_dead () {
+	#first and only argument should be a process id
+	#exit status is same as that of the process it's checking/killing, but if it can't kill it, exit status is 137
+	#so, status 0 implies the process finished successfully and did not need to be killed
+	pid=$1
+	
+	#we don't want to see job control messages, so redirect stderr to /dev/null, but save it to restore later (as fd 3)
+	#however, some things in the meantime (before restoring) we want to let write to stderr if they want; redirect them to the temporary fd (3)
+	exec 3>&2 2>/dev/null
+
+	if alive "$pid"; then
+		$verbose && log "process [$pid] still alive, sending SIGTERM" 2>&3
+		kill -TERM "$pid"  #(stderr is already /dev/null)
+		for t in 0 0.5 1 2 4; do
+			sleep $t
+			alive "$pid" || break
+		done
+		if alive "$pid"; then
+			$verbose && log "process [$pid] still alive after SIGTERM, sending SIGKILL" 2>&3
+			kill -KILL "$pid"  #(stderr is already /dev/null)
+			for t in 0 1 2 4; do
+				sleep $t
+				alive "$pid" || break
+			done
+			if alive "$pid"; then
+				$verbose && log "unable to kill process [$pid]" 2>&3
+				return 137
+			fi
+		fi
+	fi
+	wait "$pid"
+	status=$?
+
+	#restore stderr
+	exec 2>&3-
+
+	return $status
+}
+
+pid=''
+trap 'log "exiting, pid [$$]"; test -n "$pid" && kill -KILL "$pid" &>/dev/null' EXIT
+
+log "starting, pid [$$]"
+
+
+#--- initial start up (handle starting up in partially or fully failed state)
+
+if ! ( [ -L "$main_link" ] && [ -d "$secondary_dir" ] ); then  #(not checking primary_dir here, as it may hang)
+	msg="*** ERROR *** --main-link and --secondary-dir are both required to exist"
+	#(since we're quitting, try extra hard to get this message to the user)
+	if [ -t 2 ] && ([ "$(readlink -e /dev/stdout)" != "$log_file" ] && [ "$(readlink -e /dev/sterr)" != "$log_file" ]); then
+		echo "$msg" >&2
+	fi
+	log "$msg"
+	exit 1
+fi
+
+in_failover=false
+
+$verbose && log "testing initial main_link state"
+#(this doesn't use $command_output_file since it's just an internal thing)
+$_prefix readlink -e "$main_link" >/dev/null 2>&1 &  #sometimes this hangs, if main_link -> primary_dir and primary_dir is down
+pid=$!
+
+$verbose && log "sleeping for [$max_sync_time] seconds to allow test to complete"
+sleep "$max_sync_time"
+
+make_sure_dead "$pid"
+status=$?
+pid=''
+
+if [ "$status" -ne 0 ]; then
+	log "test of main_link state failed, attempting to force failover by setting main_link [$main_link] to point to secondary_dir [$secondary_dir]"
+	if $_prefix rm "$main_link" && $_prefix ln -s "$secondary_dir" "$main_link"; then
+		in_failover=true
+		log "failover complete"
+		log "WARNING: already in a failed state upon starting"
+		test -n "$email" && date '+%Y-%m-%d %H:%M:%S' | mail -s "$email_subject_base: failover event" $email
+	else
+		msg="*** ERROR *** unable to ensure main_link [$main_link] is sane"
+		#(since we're quitting, try extra hard to get this message to the user)
+		if [ -t 2 ] && ([ "$(readlink -e /dev/stdout)" != "$log_file" ] && [ "$(readlink -e /dev/sterr)" != "$log_file" ]); then
+			echo "$msg" >&2
+		fi
+		log "$msg"
+		exit 1
+	fi
+else
+	#it's readable, now make sure it points to one of the two
+	if   [ "$(readlink -e "$main_link" 2>/dev/null)" = "$(readlink -e "$secondary_dir" 2>/dev/null)" ]; then
+		#it has already been failed over
+		$verbose && log "test of main_link state successful, pointing to secondary_dir [$secondary_dir]"
+		log "WARNING: already in a failed state upon starting"
+		in_failover=true
+	elif [ "$(readlink -e "$main_link" 2>/dev/null)" = "$(readlink -e "$primary_dir" 2>/dev/null)" ]; then
+		$verbose && log "test of main_link state successful, pointing to primary_dir [$primary_dir]"
+		in_failover=false
+	else
+		msg="*** ERROR *** --main-link exists but points to neither --primary-dir nor --secondary-dir"
+		#(since we're quitting, try extra hard to get this message to the user)
+		if [ -t 2 ] && ([ "$(readlink -e /dev/stdout)" != "$log_file" ] && [ "$(readlink -e /dev/sterr)" != "$log_file" ]); then
+			echo "$msg" >&2
+		fi
+		log "$msg"
+		exit 1
+	fi
+fi
+
+
+#--- main loop
+
+while true; do
+	if $in_failover; then
+		$verbose && log "initiating loop in failover mode"
+	else
+		$verbose && log "initiating loop in normal mode"
+	fi
+	
+	rsync_opts=''
+	if $in_failover; then
+		#attempt the primary->secondary sync in dry-run mode; success will indicate it's working again
+		$verbose && log "intiating dry-run sync of primary_dir [$primary_dir] to secondary_dir [$secondary_dir] in background to test for recovery"
+		rsync_opts="$rsync_opts --dry-run"
+	else
+		#do an actual sync of primary->secondary
+		$verbose && log "intiating sync of primary_dir [$primary_dir] to secondary_dir [$secondary_dir] in background"
+	fi
+	$timestamp_command_output_file && date '+%Y-%m-%d %H:%M:%S' >> "$command_output_file"
+	#these rsync  options, specifically --delete, reflect that we want an exact copy of the primary
+	$_prefix rsync --archive --delete --quiet $rsync_opts "$primary_dir"/ "$secondary_dir"/ >>"$command_output_file" 2>&1 &
+	pid=$!
+	
+	$verbose && log "sleeping for max_sync_time [$max_sync_time] seconds"
+	sleep "$max_sync_time"
+	
+	make_sure_dead "$pid"
+	status_sync=$?
+	pid=''
+	
+	[ "$status_sync" -eq 0 ] && $verbose && log "sync successful"
+
+	status_write_probe='n/a'  #let this mean "not run"
+	if [ "$status_sync" -eq 0 ] && [ -n "$write_probe" ]; then
+		$verbose && log "intiating write probe test in background"
+		$timestamp_command_output_file && date '+%Y-%m-%d %H:%M:%S' >> "$command_output_file"
+		$_prefix bash -c "$write_probe" >>"$command_output_file" 2>&1 &
+		pid=$!
+
+		$verbose && log "sleeping for max_write_probe_time [$max_write_probe_time] seconds"
+		sleep "$max_write_probe_time"
+	
+		make_sure_dead "$pid"
+		status_write_probe=$?
+		pid=''
+		
+		[ "$status_write_probe" -eq 0 ] && $verbose && log "write probe successful"
+	fi
+
+	if [ "$status_sync" -ne 0 ] || ([ "$status_write_probe" != 'n/a' ] && [ "$status_write_probe" -gt 0 ]); then
+		msg=""
+		if [ -n "$write_probe" ]; then
+			msg="sync and/or write probe failed (sync status [$status_sync], write probe status [$status_write_probe])"
+		else
+			msg="sync failed (sync status [$status_sync])"
+		fi
+		if $in_failover; then
+			#already in failover mode, this just means it hasn't recovered yet
+			$verbose && log "$msg, staying in failover mode"
+		else
+			#normal sync failed, failover
+			log "$msg, failover from primary_dir [$primary_dir] to secondary_dir [$secondary_dir] initiated"
+			log "adjusting main_link symbolic link [$main_link]"
+			if $_prefix rm "$main_link" && $_prefix ln -s "$secondary_dir" "$main_link"; then
+				in_failover=true
+				log "failover complete"
+				test -n "$email" && date '+%Y-%m-%d %H:%M:%S' | mail -s "$email_subject_base: failover event" $email
+			else
+				log "failed to failover main_link [$main_link], bailing out, only hope is re-try will work"
+			fi
+		fi
+	else
+		if $in_failover; then
+			#failback
+			msg='dry-run primary sync'
+			test -n "$write_probe" && msg="$msg and actual write probe test"
+			log "$msg worked, failback from secondary_dir [$secondary_dir] to primary_dir [$primary_dir] initiated"
+			
+			#sync secondary back to primary, to capture the modifications that have been made during the failover
+			log "initiating sync back of [$secondary_dir] to [$primary_dir] in background"
+			$timestamp_command_output_file && date '+%Y-%m-%d %H:%M:%S' >> "$command_output_file"
+			#these rsync options are for the specific case where files are not added to or removed from the storage (i.e. do not use --delete! and only --existing, so we don't put back files that where already deleted from the primary)
+			$_prefix rsync --archive --update --existing --quiet "$secondary_dir"/ "$primary_dir"/ >>"$command_output_file" 2>&1 &
+			pid=$!
+
+			$verbose && log "sleeping for max_sync_time [$max_sync_time] seconds"
+			
+			sleep "$max_sync_time"
+			make_sure_dead "$pid"
+			status=$?
+			pid=''
+
+			if [ "$status" -ne 0 ]; then
+				log "failback sync failed with status [$status], staying in failover mode"
+			else
+				log "sync back successfull"
+				log "adjusting main_link symbolic link [$main_link]"
+				if $_prefix rm "$main_link" && $_prefix ln -s "$primary_dir" "$main_link"; then
+					in_failover=false
+					log "failback complete"
+					test -n "$email" && date '+%Y-%m-%d %H:%M:%S' | mail -s "$email_subject_base: failback event" $email
+					#NOTE: the secondary hasn't received the updates from the primary since before the failover; we want to rerun that sync as soon as possible
+					_skip_sleep=true
+				else
+					log "failed to failback main_link [$main_link], bailing out, only hope is re-try will work"
+				fi
+			fi
+		fi
+	fi
+	
+	if $_skip_sleep; then
+		$verbose && log "skipping sleep in order to catch up on sync"
+		_skip_sleep=false
+	else
+		$verbose && log "sleeping for sleep_interval_between_syncs [$sleep_interval_between_syncs] seconds"
+		sleep "$sleep_interval_between_syncs"
+	fi
+done
