@@ -11,7 +11,9 @@ SYNOPSIS
 DESCRIPTION
     Maintains high-availability of a directory, such as on a network filesystem 
     share, by using a local backup copy and failing over to that in case the 
-    primary directory becomes unresonsive or shows errors.
+    primary directory becomes unresonsive or shows errors.  Anything relying on 
+    the directory should refer to it by the symbolic link that this script 
+    maintains.
 
     The main link in normal state should be symbolic link to the primary 
     directory.  This script loops forever, syncing the primary directory to the 
