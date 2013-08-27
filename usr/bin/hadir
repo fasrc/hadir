@@ -32,8 +32,9 @@ DESCRIPTION
     to the primary when things failback.  Modifications to files that still 
     exist on the primary are synced back during failback, though.
 
-    This doesn't save exactly what the errors are from any of the syncs -- in 
-    practice it usually hangs.
+    By default, this doesn't save exactly what the errors are from any of the 
+    syncs (in practice it usually hangs).  Use --command-output-file to log it 
+    to a file.
 
     Furthermore, rsync just checks sized and modification times.  It's possible 
     this misses actual errors that would happen when the files are used.
