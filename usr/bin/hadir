@@ -3,7 +3,7 @@ set +m
 
 helpstr="\
 NAME
-    hadir - highly-available directory maintainer
+    hadir - add highly-availability to a directory on a network filesystem
 
 SYNOPSIS
     hadir --main-link PATH --primary-dir PATH --secondary-dir PATH
